@@ -1,0 +1,5 @@
+Hello! Welcome to my Python voice cloning demo.
+In just a few minutes, we will generate speech in my own voice.
+Python is an amazing language for beginners and experts alike!
+With this tool, you can convert any text into spoken audio using your voice.
+Let's have some fun and see it in action!
