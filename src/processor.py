@@ -2,97 +2,46 @@
 Text Processor for Voice Cloning
 Optimizes text for natural speech synthesis
 """
+import re
+from utils.logging import get_logger
+
+log = get_logger('TextProcessor')
 
 def process_text(raw_text: str) -> str:
     """
-    Enhance text for natural speech synthesis:
-    - Add proper spacing after punctuation
-    - Split overly long sentences
-    - Clean up formatting issues
-    - Handle abbreviations and numbers
-    
-    Args:
-        raw_text (str): Original text to process
-        
-    Returns:
-        str: Processed text optimized for TTS
+    Enhanced text processing for expressive speech synthesis.
+    This version returns a cleaned string without SSML, as the `VoiceClone` class
+    now handles the markup and applies the effects after generation.
     """
     if not raw_text or not raw_text.strip():
+        log.warning("Received empty text for processing.")
         return ""
     
-    # Basic cleanup
+    # Normalize line breaks
     text = raw_text.strip()
-    
-    # Normalize line breaks and excessive whitespace
-    text = ' '.join(text.split())
+    text = re.sub(r'\s*\n\s*', ' ', text)
     
     # Fix punctuation spacing
-    text = text.replace("...", "…")  # Replace triple dots with ellipsis
-    text = text.replace(".", ". ")
-    text = text.replace("?", "? ")
-    text = text.replace("!", "! ")
-    text = text.replace(",", ", ")
-    text = text.replace(";", "; ")
-    text = text.replace(":", ": ")
+    text = re.sub(r'([.?!,;:])\s*', r'\1 ', text)
+    text = re.sub(r'\s{2,}', ' ', text) # Remove double spaces
     
-    # Fix double spaces created by replacements
-    while "  " in text:
-        text = text.replace("  ", " ")
+    # Simple and fast sentence splitting
+    sentences = re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=[.?!])\s+', text)
     
-    # Split sentences that are too long (better for TTS processing)
-    sentences = text.split(". ")
-    enhanced_sentences = []
+    # Join sentences back together with a single space to avoid
+    # a long single string which causes the tokenization error
+    processed_text = ' '.join(sentences)
     
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-            
-        # If sentence is very long, try to split at natural break points
-        if len(sentence.split()) > 20:  # More than 20 words
-            # Try splitting at commas, semicolons, or conjunctions
-            parts = []
-            for part in sentence.split(", "):
-                if len(part.split()) > 15:
-                    # Further split on "and", "but", "or", "so"
-                    for conjunction in [" and ", " but ", " or ", " so ", " because "]:
-                        if conjunction in part:
-                            sub_parts = part.split(conjunction)
-                            if len(sub_parts) == 2:
-                                parts.append(sub_parts[0].strip())
-                                parts.append(conjunction.strip() + " " + sub_parts[1].strip())
-                                break
-                    else:
-                        parts.append(part.strip())
-                else:
-                    parts.append(part.strip())
-            enhanced_sentences.extend([p for p in parts if p])
-        else:
-            enhanced_sentences.append(sentence)
-    
-    # Join sentences back together
-    result = ". ".join([s.strip() for s in enhanced_sentences if s.strip()])
-    
-    # Final cleanup
-    result = result.replace("…", "...")  # Convert back to triple dots
-    result = result.replace(" .", ".")
-    result = result.replace(" ?", "?")
-    result = result.replace(" !", "!")
-    result = result.replace(" ,", ",")
-    
-    # Ensure proper sentence ending
-    if result and not result.endswith(('.', '!', '?')):
-        result += "."
-    
-    return result
+    log.debug(f"Original text length: {len(raw_text)} -> Processed text length: {len(processed_text)}")
+    return processed_text.strip()
 
 # Test function
 if __name__ == "__main__":
     # Test the text processor
     sample_text = """
-    Hello!Welcome to my Python voice cloning demo.In just a few minutes,we will generate speech in my own voice.
+    Hello! Welcome to my Python voice cloning demo. In just a few minutes, we will generate speech in my own voice.
     This is a very long sentence that probably should be broken up into smaller parts because it contains too many words and ideas that could be separated for better speech synthesis and more natural sounding output.
-    Python is amazing   !  With this tool,you can convert any text into spoken audio.Let's have fun!
+    Python is amazing ! With this tool, you can convert any text into spoken audio. Let's have fun!
     """
     
     processed = process_text(sample_text)

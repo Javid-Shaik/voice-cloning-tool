@@ -4,3 +4,4 @@ data/output/*.wav
 
 .venv/
 __pycache__/
+logs/
