@@ -9,9 +9,16 @@ import pickle
 import re
 from pathlib import Path
 from threading import Lock
+from torch.nn import functional as F
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from TTS.api import TTS
 from progress import ProgressSpinner
 from utils.logging import get_logger, logger_manager
+from text_encoding import TextEncoder, chunk_for_prosody, align_to_frames
+from ssml_processor import SSMLProcessor
+from prosody_models import ProsodyPredictor, EmotionalProsodyAdapter
+from vocoder import HiFiGANVocoder
+
 
 # Get module logger
 log = get_logger('VoiceClone')
@@ -64,9 +71,35 @@ os.environ['TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD'] = '1'
 
 class UltimateVoiceClone:
     """
-    Ultimate optimized voice cloning with 20+ years of TTS experience
+    Ultimate optimized voice cloning with emotional intelligence
     Targets: RTF < 1.0, High quality, Zero artifacts, Maximum reliability
+    
+    Supports both inference and training modes:
+    - Inference: Ultra-fast, high-quality voice cloning with emotion control
+    - Training: End-to-end training for voice and emotion adaptation
     """
+    
+    # Emotion mapping for consistent processing
+    emotion_to_id = {
+        'neutral': 0,
+        'happy': 1,
+        'sad': 2,
+        'excited': 3,
+        'whisper': 4,
+        'intimate': 5,
+        'angry': 6
+    }
+    
+    # Emotion-specific audio processing settings
+    emotion_audio_params = {
+        'happy': {'pitch': 1.04, 'rate': 1.02, 'volume': 1.03, 'brightness': 1.1},
+        'sad': {'pitch': 0.98, 'rate': 0.96, 'volume': 0.96, 'brightness': 0.9},
+        'excited': {'pitch': 1.06, 'rate': 1.06, 'volume': 1.08, 'brightness': 1.2},
+        'whisper': {'pitch': 0.96, 'rate': 0.98, 'volume': 0.75, 'brightness': 0.8},
+        'intimate': {'pitch': 0.97, 'rate': 0.95, 'volume': 0.85, 'brightness': 0.9},
+        'angry': {'pitch': 1.03, 'rate': 1.05, 'volume': 1.1, 'brightness': 1.15},
+        'neutral': {'pitch': 1.0, 'rate': 1.0, 'volume': 1.0, 'brightness': 1.0}
+    }
     _instance = None
     _model_lock = Lock()
 
@@ -75,11 +108,58 @@ class UltimateVoiceClone:
             cls._instance = super(UltimateVoiceClone, cls).__new__(cls)
         return cls._instance
 
-    def __init__(self):
+    def __init__(self, training_mode=False, config=None):
         if hasattr(self, 'initialized'):
             return
 
-        log.info("Initializing Ultimate Voice Cloning System")
+        # Set mode and load config
+        self.training_mode = training_mode
+        self.config = config
+        
+        log.info(f"Initializing Ultimate Voice Cloning System (Mode: {'Training' if training_mode else 'Inference'})")
+        
+        self.text_encoder = TextEncoder(language='en-us')
+        self.ssml_processor = SSMLProcessor()
+        
+        # Initialize components based on mode
+        if training_mode and config is not None:
+            # Training mode components with config
+            self.prosody_predictor = ProsodyPredictor(
+                input_size=config['model']['input_dim'],
+                hidden_size=config['model']['hidden_dim'],
+                num_emotions=config['model']['emotion_dim']
+            )
+            
+            self.vocoder = HiFiGANVocoder(
+                model_name="universal_large",
+                sample_rate=config['data']['sample_rate']
+            )
+            
+            self.emotion_adapter = EmotionalProsodyAdapter(
+                num_emotions=config['model']['emotion_dim'],
+                hidden_size=config['model']['hidden_dim']
+            )
+            
+            # Initialize training optimizers
+            self.setup_training_components()
+        else:
+            # Inference mode components with default settings
+            self.prosody_predictor = ProsodyPredictor(
+                input_size=768,  # BERT hidden size
+                hidden_size=256,
+                num_emotions=8
+            )
+            
+            self.vocoder = HiFiGANVocoder(
+                model_name="universal_large",
+                sample_rate=48000
+            )
+            
+            self.emotion_adapter = EmotionalProsodyAdapter(
+                num_emotions=8,
+                hidden_size=256
+            )
+
         
         # Core configuration
         self.model_name = "tts_models/multilingual/multi-dataset/xtts_v2"
@@ -341,13 +421,27 @@ class UltimateVoiceClone:
     def ultra_fast_generate_chunk(self, text: str, language: str = "en",
                                   pitch_scale: float = 1.0, speed_scale: float = 1.0,
                                   energy_scale: float = 1.0) -> np.ndarray:
-        """ULTIMATE chunk generation with deterministic, stable parameters"""
+        """ULTIMATE chunk generation with SSML support and deterministic parameters"""
         try:
+            # Parse SSML and get plain text
+            plain_text = self.clean_markup(text)
+            
             # Fix character spacing if present
-            if self._is_character_spaced(text):
-                text = self._collapse_character_spaced(text)
+            if self._is_character_spaced(plain_text):
+                plain_text = self._collapse_character_spaced(plain_text)
+                
+            # Get prosody modifications from SSML
+            pitch_mod, speed_mod, energy_mod = self.process_markup_effects(text)
 
-            # FAST PATH: Use precomputed conditioning with DETERMINISTIC parameters
+            # Process text through prosody predictor
+            encoded_text = self.text_encoder.encode(text)
+            
+            # Generate prosody features
+            prosody_features = self.prosody_predictor(
+                torch.tensor(encoded_text['features']).unsqueeze(0).to(self.device)
+            )
+            
+            # FAST PATH: Use precomputed conditioning with advanced prosody
             if self.current_gpt_cond_latent is not None and self.current_speaker_embedding is not None:
                 # Get unwrapped model for direct inference
                 xtts = self.tts.synthesizer.tts_model
@@ -405,75 +499,156 @@ class UltimateVoiceClone:
 
     def process_markup_effects(self, text: str, base_pitch: float = 1.0,
                                base_speed: float = 1.0, base_energy: float = 1.0):
-        """Process expression markup"""
+        """Process SSML markup for prosody and emotion effects"""
+        # Parse SSML
+        segments = self.ssml_processor.parse(text)
+        
+        # Initialize base values
         current_pitch = base_pitch
-        current_speed = base_speed  
+        current_speed = base_speed
         current_energy = base_energy
-
-        # Expression effects
-        if '[happy]' in text:
-            current_pitch *= 1.04
-            current_speed *= 1.02
-            current_energy *= 1.03
-        elif '[sad]' in text:
-            current_pitch *= 0.98
-            current_speed *= 0.96
-            current_energy *= 0.96
-        elif '[excited]' in text:
-            current_pitch *= 1.06
-            current_speed *= 1.06
-            current_energy *= 1.08
-        elif '[whisper]' in text:
-            current_pitch *= 0.96
-            current_speed *= 0.98
-            current_energy *= 0.75
-        elif '[emphasis]' in text:
-            current_pitch *= 1.02
-            current_speed *= 0.98
-            current_energy *= 1.08
-
-        # Rate controls
-        if '[rate=slow]' in text:
-            current_speed *= 0.88
-        elif '[rate=fast]' in text:
-            current_speed *= 1.12
+        
+        # Process segments to accumulate effects
+        for segment in segments:
+            if segment['type'] == 'prosody':
+                params = segment['parameters']
+                # Apply prosody parameters
+                if 'pitch' in params:
+                    if params['pitch'].endswith('%'):
+                        current_pitch *= float(params['pitch'][:-1]) / 100
+                    elif params['pitch'].endswith('Hz'):
+                        current_pitch = float(params['pitch'][:-2]) / 100
+                if 'rate' in params:
+                    if params['rate'].endswith('%'):
+                        current_speed *= float(params['rate'][:-1]) / 100
+                if 'volume' in params:
+                    if params['volume'].endswith('dB'):
+                        current_energy *= 10 ** (float(params['volume'][:-2]) / 20)
+                    elif params['volume'].endswith('%'):
+                        current_energy *= float(params['volume'][:-1]) / 100
             
-        # Pitch controls
-        if '[pitch=high]' in text:
-            current_pitch *= 1.06
-        elif '[pitch=low]' in text:
-            current_pitch *= 0.94
-
+            elif segment['type'] == 'emotion':
+                # Get emotion parameters from SSML processor's mapping
+                emotion = segment.get('emotion', 'neutral')
+                if emotion in self.ssml_processor.EMOTION_MAPS:
+                    params = self.ssml_processor.EMOTION_MAPS[emotion]
+                    # Apply emotion effects
+                    if 'pitch' in params:
+                        value = self.ssml_processor._convert_percentage(params['pitch'])
+                        current_pitch *= value
+                    if 'rate' in params:
+                        value = self.ssml_processor._convert_percentage(params['rate'])
+                        current_speed *= value
+                    if 'volume' in params:
+                        value = self.ssml_processor._convert_percentage(params['volume'])
+                        current_energy *= value
+            
+            elif segment['type'] == 'emphasis':
+                level = segment.get('level', 'moderate')
+                # Map emphasis levels to multipliers
+                emphasis_map = {
+                    'strong': {'pitch': 1.15, 'speed': 0.9, 'energy': 1.3},
+                    'moderate': {'pitch': 1.1, 'speed': 0.95, 'energy': 1.15},
+                    'reduced': {'pitch': 0.95, 'speed': 1.05, 'energy': 0.9}
+                }
+                if level in emphasis_map:
+                    current_pitch *= emphasis_map[level]['pitch']
+                    current_speed *= emphasis_map[level]['speed']
+                    current_energy *= emphasis_map[level]['energy']
+        
         return current_pitch, current_speed, current_energy
 
     def clean_markup(self, text: str) -> str:
-        """Remove markup tags"""
-        clean_text = text
-        for tag in ['happy', 'sad', 'excited', 'whisper', 'emphasis']:
-            clean_text = clean_text.replace(f'[{tag}]', '').replace(f'[/{tag}]', '')
-        for tag in ['rate=slow', 'rate=fast', 'pitch=high', 'pitch=low']:
-            clean_text = clean_text.replace(f'[{tag}]', '').replace(f'[/{tag}]', '')
-        return clean_text.strip()
+        """Extract plain text from SSML markup"""
+        try:
+            segments = self.ssml_processor.parse(text)
+            return self.ssml_processor.flatten_segments_to_text(segments)
+        except Exception as e:
+            log.warning(f"SSML parsing failed, falling back to simple cleanup: {e}")
+            return re.sub(r'<[^>]+>', '', text).strip()
+        
+    def get_emotion_from_ssml(self, text: str) -> str:
+        """Extract primary emotion from SSML markup"""
+        try:
+            segments = self.ssml_processor.parse(text)
+            for segment in segments:
+                if segment['type'] == 'emotion' and 'emotion' in segment:
+                    return segment['emotion']
+        except Exception as e:
+            log.warning(f"Failed to extract emotion from SSML: {e}")
+        return 'neutral'
+        
+    def apply_emotion_effects(self, audio: np.ndarray, emotion: str,
+                             sr: int = 48000) -> np.ndarray:
+        """Apply emotion-specific audio effects"""
+        if emotion not in self.emotion_audio_params:
+            return audio
+            
+        params = self.emotion_audio_params[emotion]
+        
+        # Apply audio effects based on emotion
+        audio = process_audio(
+            audio,
+            sr,
+            pitch_scale=params['pitch'],
+            speed_scale=params['rate'],
+            energy_scale=params['volume']
+        )
+        
+        return audio
 
-    def optimal_normalize_audio(self, audio: np.ndarray) -> np.ndarray:
-        """Gentle, high-quality audio normalization"""
+    def optimal_normalize_audio(self, audio: np.ndarray, emotion: str = 'neutral') -> np.ndarray:
+        """Enhanced audio normalization with emotion-aware processing"""
         # Remove DC offset
         audio = audio - np.mean(audio)
         
-        # Gentle peak normalization to -3dB (much better than aggressive limiting)
+        # Emotion-specific normalization targets
+        emotion_targets = {
+            'excited': -2.0,  # More headroom for dynamic range
+            'angry': -2.5,    # Strong presence
+            'happy': -3.0,    # Standard level
+            'neutral': -3.0,  # Standard level
+            'sad': -4.0,      # Softer presence
+            'intimate': -5.0, # Very soft
+            'whisper': -6.0   # Extra soft
+        }
+        
+        target_db = emotion_targets.get(emotion, -3.0)
+        target_linear = 10 ** (target_db / 20)
+        
+        # Gentle peak normalization
         max_val = np.max(np.abs(audio))
         if max_val > 0:
-            audio = audio * (0.707 / max_val)  # -3dB target
+            audio = audio * (target_linear / max_val)
         
-        # Light soft limiting (much gentler than tanh)
-        audio = np.clip(audio, -0.95, 0.95)
+        # Emotion-aware dynamic processing
+        if emotion in ['excited', 'angry']:
+            # More aggressive limiting for energetic emotions
+            audio = np.tanh(audio * 0.85) * 0.95
+        else:
+            # Gentler limiting for other emotions
+            audio = np.clip(audio, -0.95, 0.95)
         
         return audio
 
     def generate_ultra_fast(self, text: str, voice_sample: str, output_file: str,
                             language: str = "en", emotion_scale: float = 1.0,
                             speaking_rate: float = 1.0, pitch_scale: float = 1.0,
-                            quality_mode: str = 'balanced') -> str:
+                            quality_mode: str = 'balanced', emotion: str = 'neutral') -> str:
+        """Enhanced generation with emotional expression support
+        Args:
+            text: Input text to synthesize
+            voice_sample: Path to voice sample file
+            output_file: Path to save generated audio
+            language: Target language code
+            emotion_scale: Overall emotion intensity (0.0-2.0)
+            speaking_rate: Speech rate multiplier
+            pitch_scale: Pitch shift multiplier
+            quality_mode: Quality preset ('ultra_fast', 'fast', 'balanced', 'quality')
+            emotion: Target emotion ('neutral', 'happy', 'sad', 'excited', 'whisper', 'intimate', 'angry')
+        Returns:
+            Path to generated audio file
+        """
         """ULTIMATE generation method - optimized for speed, quality, and reliability"""
         start_total_time = time.time()
         logger_manager.start_operation('ultimate_voice_generation')
@@ -509,10 +684,29 @@ class UltimateVoiceClone:
                     chunk_start = time.time()
 
                     try:
-                        # Process markup effects
+                        # Process markup and emotion effects
                         pitch, speed, energy = self.process_markup_effects(
                             chunk, pitch_scale, speaking_rate, emotion_scale
                         )
+                        
+                        # Extract emotion from chunk or use global emotion
+                        chunk_emotion = 'neutral'
+                        for e in ['happy', 'sad', 'excited', 'whisper', 'intimate', 'angry']:
+                            if f'[{e}]' in chunk:
+                                chunk_emotion = e
+                                break
+                        
+                        # Apply emotion-specific processing
+                        if chunk_emotion != 'neutral':
+                            # Get emotion features
+                            emotion_features = self.emotion_adapter.get_emotion_embedding(
+                                torch.tensor([self.emotion_to_id[chunk_emotion]]).to(self.device)
+                            )
+                            
+                            # Modify prosody based on emotion
+                            pitch *= self.emotion_adapter.EMOTION_MAPS[chunk_emotion].get('pitch', 1.0)
+                            speed *= self.emotion_adapter.EMOTION_MAPS[chunk_emotion].get('rate', 1.0)
+                            energy *= self.emotion_adapter.EMOTION_MAPS[chunk_emotion].get('volume', 1.0)
 
                         # Clean markup
                         clean_chunk = self.clean_markup(chunk)
@@ -606,6 +800,159 @@ class UltimateVoiceClone:
             "en", "es", "fr", "de", "it", "pt", "pl", "tr",
             "ru", "nl", "cs", "ar", "zh", "ja", "hu", "ko", "hi"
         ]
+    
+    def setup_training_components(self):
+        """Initialize optimizers and other training components"""
+        if not self.training_mode:
+            return
+            
+        # Collect trainable parameters
+        parameters = list(self.prosody_predictor.parameters()) + \
+                    list(self.vocoder.parameters()) + \
+                    list(self.emotion_adapter.parameters())
+                    
+        # Initialize optimizer
+        self.optimizer = torch.optim.AdamW(
+            parameters,
+            lr=self.config['training']['learning_rate'],
+            weight_decay=self.config['training']['weight_decay']
+        )
+        
+        # Initialize learning rate scheduler
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=self.config['training']['num_epochs'],
+            eta_min=self.config['training']['min_lr']
+        )
+        
+        # Initialize loss functions
+        self.reconstruction_loss = torch.nn.L1Loss()
+        self.emotion_loss = torch.nn.CrossEntropyLoss()
+        self.prosody_loss = torch.nn.MSELoss()
+    
+    def train_step(self, batch):
+        """Execute one training step"""
+        if not self.training_mode:
+            raise RuntimeError("Model not in training mode")
+            
+        self.optimizer.zero_grad()
+        
+        # Move batch to device
+        audio = batch['audio'].to(self.device)
+        emotion = batch['emotion'].to(self.device)
+        text = batch['text']
+        
+        # Forward pass
+        encoded_text = self.text_encoder(text)
+        prosody_features = self.prosody_predictor(encoded_text)
+        emotion_features = self.emotion_adapter(emotion)
+        
+        # Generate audio
+        output = self.vocoder(prosody_features, emotion_features)
+        
+        # Calculate losses
+        recon_loss = self.reconstruction_loss(output, audio)
+        emo_loss = self.emotion_loss(emotion_features, emotion)
+        pros_loss = self.prosody_loss(prosody_features, batch['prosody'].to(self.device))
+        
+        # Total loss
+        loss = recon_loss + \
+               self.config['training']['emotion_weight'] * emo_loss + \
+               self.config['training']['prosody_weight'] * pros_loss
+               
+        # Backward pass
+        loss.backward()
+        
+        # Clip gradients
+        torch.nn.utils.clip_grad_norm_(
+            self.parameters(),
+            self.config['training']['grad_clip']
+        )
+        
+        self.optimizer.step()
+        
+        return {
+            'loss': loss.item(),
+            'reconstruction_loss': recon_loss.item(),
+            'emotion_loss': emo_loss.item(),
+            'prosody_loss': pros_loss.item()
+        }
+    
+    def validate_step(self, batch):
+        """Execute one validation step"""
+        if not self.training_mode:
+            raise RuntimeError("Model not in training mode")
+            
+        with torch.no_grad():
+            # Move batch to device
+            audio = batch['audio'].to(self.device)
+            emotion = batch['emotion'].to(self.device)
+            text = batch['text']
+            
+            # Forward pass
+            encoded_text = self.text_encoder(text)
+            prosody_features = self.prosody_predictor(encoded_text)
+            emotion_features = self.emotion_adapter(emotion)
+            
+            # Generate audio
+            output = self.vocoder(prosody_features, emotion_features)
+            
+            # Calculate losses
+            recon_loss = self.reconstruction_loss(output, audio)
+            emo_loss = self.emotion_loss(emotion_features, emotion)
+            pros_loss = self.prosody_loss(prosody_features, batch['prosody'].to(self.device))
+            
+            # Total loss
+            loss = recon_loss + \
+                   self.config['training']['emotion_weight'] * emo_loss + \
+                   self.config['training']['prosody_weight'] * pros_loss
+            
+            return {
+                'loss': loss.item(),
+                'reconstruction_loss': recon_loss.item(),
+                'emotion_loss': emo_loss.item(),
+                'prosody_loss': pros_loss.item()
+            }
+    
+    def save_checkpoint(self, path):
+        """Save model checkpoint"""
+        if not self.training_mode:
+            raise RuntimeError("Model not in training mode")
+            
+        checkpoint = {
+            'prosody_predictor': self.prosody_predictor.state_dict(),
+            'vocoder': self.vocoder.state_dict(),
+            'emotion_adapter': self.emotion_adapter.state_dict(),
+            'optimizer': self.optimizer.state_dict() if hasattr(self, 'optimizer') else None,
+            'scheduler': self.scheduler.state_dict() if hasattr(self, 'scheduler') else None,
+            'config': self.config
+        }
+        torch.save(checkpoint, path)
+    
+    def load_checkpoint(self, path):
+        """Load model checkpoint"""
+        checkpoint = torch.load(path, map_location=self.device)
+        
+        self.prosody_predictor.load_state_dict(checkpoint['prosody_predictor'])
+        self.vocoder.load_state_dict(checkpoint['vocoder'])
+        self.emotion_adapter.load_state_dict(checkpoint['emotion_adapter'])
+        
+        if self.training_mode:
+            if 'optimizer' in checkpoint and checkpoint['optimizer']:
+                self.optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'scheduler' in checkpoint and checkpoint['scheduler']:
+                self.scheduler.load_state_dict(checkpoint['scheduler'])
+    
+    def parameters(self):
+        """Return all trainable parameters"""
+        if not self.training_mode:
+            raise RuntimeError("Model not in training mode")
+            
+        params = []
+        params.extend(self.prosody_predictor.parameters())
+        params.extend(self.vocoder.parameters())
+        params.extend(self.emotion_adapter.parameters())
+        return params
 
 # Backward compatibility alias
 VoiceClone = UltimateVoiceClone

@@ -1,6 +1,6 @@
 data/voice_samples/*.wav
 data/voice_samples/*.mp3
-data/output/*.wav
+data/output/
 
 .venv/
 __pycache__/
